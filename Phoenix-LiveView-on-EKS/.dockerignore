@@ -1,0 +1,43 @@
+# Source-tree noise — keeps the build context small and prevents host
+# state from leaking into image layers.
+
+# Build artifacts
+_build/
+deps/
+priv/static/
+priv/static/cache_manifest.json
+priv/static/assets/
+
+# Test / dev only
+test/
+cover/
+*.lock.bak
+
+# Editor / OS
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Docs that don't belong in the image
+README.md
+LICENSE
+CHANGELOG*
+docs/
+
+# Anything that could carry a secret
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets/
+
+# Local-only kube / helm cruft (in case the Dockerfile is built from repo root)
+helm/
+karpenter/
+loadtest/

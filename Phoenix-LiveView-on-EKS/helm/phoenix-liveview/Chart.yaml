@@ -1,0 +1,26 @@
+apiVersion: v2
+name: phoenix-liveview
+description: |
+  Phoenix LiveView application chart. Designed for a CPU/memory-only, latency-
+  sensitive workload that holds long-lived WebSocket connections on AWS EKS
+  (target: GovCloud us-gov-west-1). Optimised for graceful drain during
+  voluntary disruption.
+
+type: application
+version: 0.1.0          # chart version — bumps on chart changes
+appVersion: "1.0.0"     # app image semantic version — overridden via values
+kubeVersion: ">=1.27.0-0"
+
+keywords:
+  - phoenix
+  - liveview
+  - elixir
+  - websocket
+
+maintainers:
+  - name: Platform Engineering
+    email: platform@example.gov
+
+annotations:
+  category: Application
+  licenses: MIT

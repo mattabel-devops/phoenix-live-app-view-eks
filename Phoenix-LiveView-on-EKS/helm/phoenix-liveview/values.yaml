@@ -1,0 +1,362 @@
+# =============================================================================
+# Default values for the phoenix-liveview chart.
+#
+# Every block below has a comment explaining WHY the default is what it is.
+# A platform engineer should be able to read this file top-to-bottom and
+# understand the operational shape of the workload without reading any
+# templates.
+# =============================================================================
+
+# ---- Image -----------------------------------------------------------------
+image:
+  # Default points at the local kind image name used for verification. In a
+  # real deploy, this is an ECR repository in the gov-west-1 partition,
+  # e.g. <acct>.dkr.ecr.us-gov-west-1.amazonaws.com/phoenix-liveview.
+  repository: phoenix-liveview
+  tag: ""                  # falls back to .Chart.appVersion when empty
+  pullPolicy: IfNotPresent
+  # imagePullSecrets are only needed for private non-ECR registries. EKS in
+  # GovCloud typically uses IRSA + ECR which doesn't need a pull secret.
+  pullSecrets: []
+
+# ---- Replica & rollout -----------------------------------------------------
+# We default to 3 replicas so that:
+#   - PDB (maxUnavailable: 1) can be honoured during voluntary disruption
+#   - HPA has a sensible floor (it never scales below `minReplicas`)
+#   - We can survive a single AZ event with EKS node anti-affinity
+# In a single-replica fork (dev), set hpa.enabled=false AND pdb.enabled=false.
+replicaCount: 3
+
+# RollingUpdate is the right strategy for a LiveView workload as long as it
+# is paired with a PDB and a long terminationGracePeriodSeconds — Recreate
+# would drop every WebSocket simultaneously, which is exactly what we want
+# to avoid.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    # maxSurge: 1 — only one extra pod during rollout, keeps node pressure
+    #   predictable for the Karpenter NodePool.
+    # maxUnavailable: 0 — never drop below desired replicas mid-rollout, so
+    #   existing connections always have a healthy pod to fail over to.
+    maxSurge: 1
+    maxUnavailable: 0
+
+# ---- Labels / annotations --------------------------------------------------
+commonLabels: {}
+commonAnnotations: {}
+
+# ---- ServiceAccount + IRSA -------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""                 # defaults to fullname
+  annotations: {}
+  # In production set:
+  #   eks.amazonaws.com/role-arn: arn:aws-us-gov:iam::<acct>:role/<role>
+  # The aws-us-gov partition prefix is the most common cross-region copy-
+  # paste bug for teams new to GovCloud.
+
+# ---- RBAC ------------------------------------------------------------------
+# RBAC is only needed if the app uses libcluster's Kubernetes strategy to
+# discover sibling pods. Default OFF — the chart works without it, and the
+# blast radius of "list endpoints in this namespace" is small but real.
+rbac:
+  create: false
+  # Minimum surface for libcluster.Strategy.Kubernetes.DNS — we list
+  # endpointslices to discover peers behind the headless service.
+  rules:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["list", "get"]
+    - apiGroups: ["discovery.k8s.io"]
+      resources: ["endpointslices"]
+      verbs: ["list", "get", "watch"]
+
+# ---- Pod-level configuration ----------------------------------------------
+podAnnotations: {}
+podLabels: {}
+
+# Spread pods across nodes / zones. For a connection-holding workload this
+# is critical: a single node loss should never take down a meaningful
+# fraction of WebSocket sessions.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: {}    # populated by template with selectorLabels
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: {}    # populated by template with selectorLabels
+
+# Tolerations let pods land on the dedicated NodePool taint (see Karpenter).
+tolerations:
+  - key: workload
+    operator: Equal
+    value: liveview
+    effect: NoSchedule
+
+# Node affinity steers pods toward the dedicated NodePool without making
+# scheduling fail if that NodePool is exhausted.
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: karpenter.sh/nodepool
+              operator: In
+              values: ["liveview"]
+
+# ---- Security context ------------------------------------------------------
+# These map directly to the "restricted" Pod Security Standard. Tightening
+# beyond this requires app changes (e.g., reading-from-mounted-secrets).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  capabilities:
+    drop: ["ALL"]
+
+# ---- Resources -------------------------------------------------------------
+# Sized for ~1000 idle WebSocket connections per pod plus burst headroom.
+# BEAM memory at rest ~120 MiB; each LiveView socket adds ~30-60 KiB.
+#
+# NOTE on the missing CPU limit: BEAM reads the cgroup CPU count at boot
+# to decide its scheduler online count (Schedulers Online). With CFS
+# quotas (cpu limits), BEAM happily spawns N schedulers and then gets
+# throttled mid-reduction, which produces user-visible latency spikes
+# under burst load. We set a CPU *request* (which sets cpu.shares for
+# noisy-neighbor isolation) but no CPU limit. This is the BEAM-on-K8s
+# orthodoxy; if you must impose a CPU limit, also set:
+#   ELIXIR_ERL_OPTIONS="+S 2:2"
+# to pin scheduler count to the available CPU.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+    # cpu: intentionally unset — see comment above.
+
+# ---- BEAM tuning -----------------------------------------------------------
+beam:
+  # Max ports (sockets, ETS tables, file handles). Default 65536 is enough
+  # for the 1k-conn-per-pod target, but we raise it so a slow drain doesn't
+  # cross the ceiling.
+  maxPorts: 131072
+  # Async-thread pool sized for occasional file/IO work — keep low to leave
+  # cores for the schedulers.
+  asyncThreads: 64
+  # ERL_FLAGS — appended to the release runner.
+  extraFlags: ""
+
+# ---- Probes ----------------------------------------------------------------
+# Phoenix 1.6 does NOT ship a /health endpoint out of the box. We use a
+# TCP probe for liveness (cheap, only detects truly dead BEAM) and an
+# HTTP probe for readiness (catches "BEAM is up but the endpoint hasn't
+# bound the port yet"). If you add a /health LiveView-aware endpoint,
+# point both probes at it.
+probes:
+  startup:
+    enabled: true
+    tcpSocket:
+      port: http
+    failureThreshold: 30
+    periodSeconds: 2
+    timeoutSeconds: 2
+  readiness:
+    enabled: true
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+  liveness:
+    enabled: true
+    tcpSocket:
+      port: http
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ---- Graceful shutdown -----------------------------------------------------
+# This is the single most important block in the file for a LiveView
+# workload. Sequence on pod termination:
+#
+#   t=0     kubelet sets pod to Terminating; endpoint controllers remove
+#           it from the Service. preStop fires.
+#   t=0     preStop sleeps `preStopSleepSeconds`. This bridges the gap
+#           between "I am Terminating" and "kube-proxy on every node has
+#           updated iptables / IPVS rules", so no new connection is
+#           routed to this pod after the sleep begins.
+#   t=Δ     SIGTERM hits PID 1 (the BEAM). Phoenix endpoint enters
+#           shutdown, stops accepting new sockets, lets in-flight LiveView
+#           processes finish or migrate.
+#   t<TGP   BEAM exits cleanly. If it overshoots `terminationGracePeriod`,
+#           the kubelet SIGKILLs and any remaining sockets drop.
+#
+# We bias preStopSleep slightly high (15s) — kube-proxy IPVS propagation
+# is usually <5s, but in a busy GovCloud cluster with many namespaces it
+# can be slower.
+gracefulShutdown:
+  terminationGracePeriodSeconds: 90
+  preStopSleepSeconds: 15
+
+# ---- Service ---------------------------------------------------------------
+# ClusterIP — TLS terminates at the ingress controller / ALB. LiveView
+# upgrades a plain HTTP request to a WebSocket on the same port, so we
+# only expose one port here.
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 4000
+  annotations: {}
+  # Session affinity at the Service is None: a LiveView WebSocket creates
+  # exactly one TCP connection that pins to one pod for its lifetime, so
+  # Service-level stickiness is irrelevant. Stickiness for the *initial*
+  # GET-then-WebSocket-upgrade handshake is handled at the ingress / ALB,
+  # not here.
+  sessionAffinity: None
+
+# A headless service is used for libcluster peer discovery via DNS. Even
+# when libcluster is disabled, exposing a headless service keeps the
+# clustering story one config flip away.
+headlessService:
+  enabled: true
+  annotations:
+    # Tells the EndpointSlice controller to include not-yet-ready pods so
+    # libcluster can discover peers during a rollout.
+    service.kubernetes.io/topology-aware-hints: "auto"
+
+# ---- HPA -------------------------------------------------------------------
+# CPU is a poor primary signal for this workload because a pod can hold
+# 1000 idle WebSocket connections at near-zero CPU. Memory is also poor:
+# it grows with connections but doesn't predict latency. The right signal
+# is *active WebSocket connections per pod*, ideally combined with
+# *message throughput*. The values below give us:
+#   - CPU @ 60% as a fallback safety net.
+#   - A documented custom metric stub for the real signal.
+# Wire the custom metric via Prometheus + the Prometheus Adapter; the
+# README shows the adapter rule. Until the metric exists, the HPA falls
+# back to CPU alone.
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    # Uncomment once the prom adapter is wired up. Target = 800 active
+    # WebSocket connections per pod (≈ headroom for a 30% burst above
+    # the 1k-per-pod design point).
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: phoenix_active_websocket_connections
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "800"
+  behavior:
+    scaleUp:
+      # React quickly to bursts. Two policies, take the bigger result.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Slow on the way down: scaling in drops connections (after PDB
+      # honours the limit). 5 minutes of stable low-utilisation before
+      # we even consider removing a pod.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
+
+# ---- PodDisruptionBudget ---------------------------------------------------
+# maxUnavailable: 1 means voluntary disruption (node drains, evictions,
+# Karpenter consolidation, version rollouts) can never take down more
+# than one pod at a time. For replicaCount ≥ 3 this preserves a clear
+# majority of connection-holding capacity during any node event.
+pdb:
+  enabled: true
+  maxUnavailable: 1
+  # minAvailable: alternative encoding; pick one or the other.
+
+# ---- ConfigMap-backed env --------------------------------------------------
+# Non-secret runtime config. Keep this list short — secrets go through
+# the existingSecret reference below.
+config:
+  PHX_HOST: "liveview.example.gov"
+  # POOL_SIZE matches the env var name the upstream runtime.exs reads.
+  POOL_SIZE: "20"
+  LOG_LEVEL: "info"
+  # ECTO_IPV6 toggles inet6 on the DB driver — RDS in gov-west-1 supports
+  # dual-stack on newer engine versions.
+  ECTO_IPV6: "false"
+
+# ---- Secrets ---------------------------------------------------------------
+# We never template secret material. The chart consumes an existing
+# Secret object (created out of band via Vault / Secrets Manager /
+# external-secrets-operator). Required keys:
+#   - SECRET_KEY_BASE
+#   - DATABASE_URL
+#   - RELEASE_COOKIE
+secrets:
+  existingSecret: "phoenix-liveview-runtime"
+
+# ---- NetworkPolicy ---------------------------------------------------------
+# Off by default because policies depend on the cluster's CNI (Calico vs
+# AWS VPC CNI in network-policy mode). Turn on per-environment.
+networkPolicy:
+  enabled: false
+  ingress:
+    # Allow traffic from the ingress controller namespace.
+    fromNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    # Allow DNS + RDS. Lock down everything else.
+    allowDNS: true
+    rdsCidrs: []          # e.g. ["10.20.0.0/16"]
+
+# ---- Observability ---------------------------------------------------------
+# A placeholder for a /metrics endpoint exposed by prom_ex. We don't ship
+# the Elixir code change here; this just toggles the scrape annotation so
+# Prometheus picks the pod up if/when the endpoint exists.
+metrics:
+  enabled: false
+  port: 9568
+  path: /metrics
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}

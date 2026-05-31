@@ -1,0 +1,188 @@
+# =============================================================================
+# Karpenter NodePool — Phoenix LiveView
+#
+# This NodePool is dedicated to the connection-holding LiveView workload.
+# Every requirement below is a deliberate trade-off; see the matching
+# section in the top-level README for the full reasoning.
+#
+# Target environment: AWS GovCloud (us-gov-west-1). Karpenter v1
+# (apiVersion karpenter.sh/v1) is assumed; v0.32-style v1beta1 is
+# equivalent semantically.
+# =============================================================================
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: liveview
+  labels:
+    workload: liveview
+spec:
+  # ---------------------------------------------------------------------------
+  # template — what every node provisioned by this pool looks like.
+  # ---------------------------------------------------------------------------
+  template:
+    metadata:
+      labels:
+        workload: liveview
+        # Cost-attribution hint for the AWS billing tag → k8s label mapping
+        # most platform teams set up.
+        cost-center: platform
+    spec:
+      # Taint so only the LiveView workload lands here (matching toleration
+      # lives in values.yaml). Without this, system DaemonSets and any
+      # untainted workload would happily fill these nodes and we'd lose
+      # the isolation guarantees we'll lean on for consolidation later.
+      taints:
+        - key: workload
+          value: liveview
+          effect: NoSchedule
+
+      # ---- EC2NodeClass binding ------------------------------------------
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: liveview
+
+      # ---- Pod-side scheduling requirements ------------------------------
+      # These are merged into a per-node NodeAffinity by Karpenter.
+      requirements:
+        # ---- Architecture --------------------------------------------------
+        # AMD64 only. The Phoenix dep tree (bcrypt_elixir, comeonin) pulls
+        # NIFs that aren't always shipped as arm64 wheels. Graviton is on
+        # the "things to do once the dep matrix supports it" list — see
+        # README "What I'd add with more time".
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+        # ---- OS -----------------------------------------------------------
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+
+        # ---- Instance families --------------------------------------------
+        # Why this mix:
+        #   c-family : compute-optimized. Best $/vCPU for bursty CPU work,
+        #              which is what Phoenix looks like during a message
+        #              storm or a render burst.
+        #   m-family : general-purpose. The 1 vCPU : 4 GiB ratio matches
+        #              the steady-state shape of this workload — a pod
+        #              holding many idle WebSocket connections uses memory
+        #              long before it uses CPU.
+        # We intentionally exclude r-family (memory-optimised; we don't
+        # need 8 GiB/vCPU and the price premium is wasted), t-family
+        # (burstable CPU credits make BEAM scheduler tuning unpredictable),
+        # and metal sizes (slow provision, slow consolidation).
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["c6i", "c7i", "m6i", "m7i"]
+
+        # ---- Instance generation ------------------------------------------
+        # Newer generations only — bookend on c6i/m6i so we don't get
+        # surprise placement on legacy hardware in regions where Karpenter
+        # might otherwise reach for it.
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+
+        # ---- Sizes -------------------------------------------------------
+        # Bounded between large (2 vCPU / 4-8 GiB) and 4xlarge. Lower bound
+        # avoids the bin-packing penalty of nano/small/medium for a workload
+        # that wants at least a couple cores; upper bound caps blast radius
+        # — losing a 32xlarge instance would drop way too many connections.
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["large", "xlarge", "2xlarge", "4xlarge"]
+
+        # ---- Availability zones ------------------------------------------
+        # Spread across all gov-west-1 AZs that the VPC has subnets in.
+        # The EC2NodeClass subnetSelectorTerms tag-filters to the right
+        # subnets; this requirement makes the AZ choice explicit so
+        # topologySpreadConstraints in the Deployment work as intended.
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-gov-west-1a", "us-gov-west-1b", "us-gov-west-1c"]
+
+        # ---- Capacity type -----------------------------------------------
+        # Mixed on-demand + spot. Why mixed and not on-demand only:
+        #   - Spot is ~60-70% cheaper. For a workload that scales from 6
+        #     to 60 replicas during peak, that's the difference between
+        #     "compelling" and "OK" cost.
+        #   - The 2-minute interruption notice from EC2 is enough to drain
+        #     a node IF (a) PDB allows the eviction and (b) the pod's
+        #     terminationGracePeriodSeconds is well under 120s. Our pods
+        #     are at 90s; PDB caps disruption at one pod at a time.
+        # Why not spot only:
+        #   - Spot pools in gov-west-1 are shallower than in the commercial
+        #     partition. A simultaneous reclaim across both c6i and m6i
+        #     spot pools is a realistic event and would force the HPA to
+        #     rebuild capacity on cold on-demand instances under load.
+        #
+        # The behaviour we want — "prefer spot, fall back to on-demand" —
+        # is the default for `In: [spot, on-demand]` because Karpenter
+        # evaluates spot price first and uses on-demand only when spot
+        # capacity isn't available at lower cost. If your security
+        # posture forbids spot entirely (some IL5/6 customers do),
+        # change this to `["on-demand"]`.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+
+  # ---------------------------------------------------------------------------
+  # disruption — how aggressively Karpenter is allowed to churn nodes.
+  # ---------------------------------------------------------------------------
+  disruption:
+    # WhenEmptyOrUnderutilized vs WhenEmpty:
+    #   WhenEmpty           — safest, but leaves money on the table:
+    #                         partially-utilised nodes are never repacked,
+    #                         so the cluster's average bin-pack drifts
+    #                         downward over time.
+    #   WhenEmptyOrUnderutilized — repacks underutilised nodes; the
+    #                         eviction is voluntary, so PDB applies. With
+    #                         our maxUnavailable: 1 PDB, at most one pod
+    #                         (= a small slice of WebSocket connections)
+    #                         is disturbed per repack.
+    # We accept the modest disruption in exchange for tighter cost.
+    consolidationPolicy: WhenEmptyOrUnderutilized
+
+    # How long a node must look idle/underutilised before Karpenter acts.
+    # Set high enough that a transient lull (a brief burst-then-quiet
+    # cycle) doesn't trigger a churn that the next minute's burst would
+    # have to undo.
+    consolidateAfter: 5m
+
+    # Empty nodes still go quickly — there's no point holding them.
+    # 30s is enough to absorb sub-minute scale-up flutters.
+    # (For Karpenter v1, the empty-node deadline is part of consolidation;
+    # if running v1beta1, this is the separate `expireAfter` knob.)
+    expireAfter: 720h    # nodes get a fresh AMI/userData at least weekly
+
+    # Rate-limit voluntary disruption. The PDB on the pod selector
+    # already protects connection loss, but this is the *node-level*
+    # backstop: even if every replica had a PDB of maxUnavailable=∞,
+    # Karpenter wouldn't reclaim more than 10% of the pool's nodes per
+    # minute. Cheap insurance.
+    budgets:
+      - nodes: "10%"
+      # Block voluntary disruption entirely during a known peak window.
+      # The schedule below is a placeholder — replace with the actual
+      # business-hours window for the user base in question.
+      - nodes: "0"
+        schedule: "0 13 * * mon-fri"   # 13:00 UTC = 09:00 ET
+        duration: 4h
+        reasons:
+          - Underutilized
+          - Empty
+
+  # ---------------------------------------------------------------------------
+  # limits — hard ceiling on what this NodePool is allowed to spin up.
+  # Protects the AWS account from a runaway HPA + Karpenter feedback loop
+  # caused by, say, a bad custom-metric query.
+  # ---------------------------------------------------------------------------
+  limits:
+    cpu: "400"          # ~50 c6i.2xlarge equivalents
+    memory: 800Gi
+
+  # weight: when multiple NodePools satisfy a pod, the higher-weight one
+  # is preferred. Useful if you later add a "burst" NodePool that's
+  # on-demand-only for peak hours.
+  weight: 100

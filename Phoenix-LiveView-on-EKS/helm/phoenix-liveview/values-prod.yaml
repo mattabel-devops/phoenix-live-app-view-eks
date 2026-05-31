@@ -1,0 +1,87 @@
+# -----------------------------------------------------------------------------
+# Production overlay — values-prod.yaml
+#
+# Apply with:
+#   helm upgrade --install phoenix-liveview ./helm/phoenix-liveview \
+#     -n phoenix --create-namespace \
+#     -f helm/phoenix-liveview/values.yaml \
+#     -f helm/phoenix-liveview/values-prod.yaml
+#
+# Anything not overridden here inherits the base values.yaml defaults.
+# Keep the diff small so a reviewer can see exactly what's different
+# about production at a glance.
+# -----------------------------------------------------------------------------
+
+image:
+  repository: 123456789012.dkr.ecr.us-gov-west-1.amazonaws.com/phoenix-liveview
+  tag: ""            # set per-deploy from CI, ideally to an immutable digest
+
+replicaCount: 6      # baseline ahead of any HPA scaling
+
+serviceAccount:
+  annotations:
+    # IRSA in the gov partition — note `aws-us-gov`, not `aws`.
+    eks.amazonaws.com/role-arn: arn:aws-us-gov:iam::123456789012:role/phoenix-liveview
+
+rbac:
+  create: true       # libcluster Kubernetes strategy is on in prod
+
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    memory: 2Gi      # still no CPU limit — see values.yaml note
+
+hpa:
+  minReplicas: 6
+  maxReplicas: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    # The signal we actually trust in prod: active WS connections per pod.
+    # Requires Prometheus + prometheus-adapter; see README.
+    - type: Pods
+      pods:
+        metric:
+          name: phoenix_active_websocket_connections
+        target:
+          type: AverageValue
+          averageValue: "800"
+
+pdb:
+  maxUnavailable: 1
+
+gracefulShutdown:
+  # Bigger envelope in prod — RDS connection drain + LiveView soft-close
+  # can take a beat under burst load.
+  terminationGracePeriodSeconds: 120
+  preStopSleepSeconds: 20
+
+config:
+  PHX_HOST: "liveview.example.gov"
+  POOL_SIZE: "40"
+  LOG_LEVEL: "info"
+  ECTO_IPV6: "false"
+
+networkPolicy:
+  enabled: true
+  ingress:
+    fromNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    allowDNS: true
+    rdsCidrs:
+      - "10.20.0.0/16"     # VPC's database subnet group
+
+metrics:
+  enabled: true            # prom_ex exposes /metrics on :9568 once added
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: prometheus  # whatever your kube-prom-stack uses

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "phoenix-liveview.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+data:
+  # Non-secret runtime configuration. Anything sensitive lives in the
+  # existing Secret referenced by .Values.secrets.existingSecret.
+  APP_NAME: "demo"   # matches mix.exs `app: :demo`
+  {{- range $k, $v := .Values.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

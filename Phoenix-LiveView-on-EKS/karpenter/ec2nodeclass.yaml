@@ -1,0 +1,121 @@
+# =============================================================================
+# Karpenter EC2NodeClass — Phoenix LiveView
+#
+# Defines the actual EC2 properties of every node provisioned by the
+# matching NodePool: AMI, subnets, security groups, instance metadata,
+# block devices, IAM. Karpenter v1 (karpenter.k8s.aws/v1).
+#
+# GovCloud notes are inline. The most common cross-partition mistakes
+# (`aws` vs `aws-us-gov`, AMI ID drift) are called out at the relevant
+# field.
+# =============================================================================
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: liveview
+spec:
+  # ---------------------------------------------------------------------------
+  # AMI family + selector.
+  #
+  # AL2023 over AL2:
+  #   - Active LTS, kernel 6.x, cgroups v2 (the default for modern kubelet
+  #     and required by certain seccomp profiles).
+  #   - Includes the FIPS-validated OpenSSL build, which is the path of
+  #     least resistance for GovCloud workloads that must claim FIPS
+  #     140-3 cryptography. (The container image still needs to be a
+  #     FIPS-validated build of OTP for end-to-end claim — see README
+  #     "GovCloud-specific considerations".)
+  # ---------------------------------------------------------------------------
+  amiFamily: AL2023
+
+  # Always use the latest AMI EKS publishes for the cluster's K8s minor
+  # version. The alias resolves at provisioning time, so we don't pin a
+  # stale SSM parameter or AMI ID. Bump the K8s minor when you bump the
+  # control plane.
+  amiSelectorTerms:
+    - alias: al2023@latest
+
+  # ---------------------------------------------------------------------------
+  # Subnet + security group selection — tag-based, not ID-based.
+  #
+  # Tag-based selectors decouple the NodePool from the IDs that Terraform/
+  # CDK emits, so a VPC re-bake doesn't break Karpenter. Tag the private
+  # data-plane subnets and the worker SG accordingly in IaC.
+  # ---------------------------------------------------------------------------
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: liveview-cluster
+        # Keep the data plane in private subnets. Public-subnet workers
+        # are a finding in any reasonable GovCloud control catalog.
+        kubernetes.io/role/internal-elb: "1"
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: liveview-cluster
+
+  # ---------------------------------------------------------------------------
+  # IAM — the role attached to the instance profile. Karpenter v1 takes
+  # `role:` (a name) and creates the instance profile itself; v0.32 took
+  # `instanceProfile:` (the profile name). Adjust if you're on v1beta1.
+  #
+  # GovCloud: the role ARN partition is `aws-us-gov`, not `aws`. The role
+  # *name* below is partition-agnostic; the ARN gets reconstructed by
+  # Karpenter using the cluster's partition.
+  # ---------------------------------------------------------------------------
+  role: KarpenterNodeRole-liveview
+
+  # ---------------------------------------------------------------------------
+  # Instance metadata service (IMDS) hardening.
+  #
+  # IMDSv2 only. Hop limit 1 prevents a containerised process from
+  # reaching IMDS through the node's network namespace (it would need
+  # hop 2). This is the single most important EC2-level control for
+  # preventing SSRF → instance role token exfiltration.
+  # ---------------------------------------------------------------------------
+  metadataOptions:
+    httpEndpoint: enabled
+    httpTokens: required           # v2 only
+    httpPutResponseHopLimit: 1     # block container-from-pod-network access
+    httpProtocolIPv6: disabled
+
+  # ---------------------------------------------------------------------------
+  # Block devices.
+  #
+  # gp3 over gp2 (better $/IOPS, throughput knob), encrypted with the
+  # cluster KMS key. The root volume is the kubelet's working set
+  # (containers, image cache, logs); 100 GiB is sized for an instance
+  # holding a handful of image generations + ephemeral storage for the
+  # crash-dump emptyDir we mount into the pods.
+  # ---------------------------------------------------------------------------
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeType: gp3
+        volumeSize: 100Gi
+        iops: 3000
+        throughput: 125
+        deleteOnTermination: true
+        encrypted: true
+        # The aws-us-gov partition arn form. Replace the key id with the
+        # actual cluster KMS key.
+        kmsKeyID: "arn:aws-us-gov:kms:us-gov-west-1:123456789012:key/REPLACE-ME"
+
+  # ---------------------------------------------------------------------------
+  # Detailed monitoring — 1-minute CloudWatch instance metrics. Cheap;
+  # gets us scaling-event visibility that Karpenter alone can't provide.
+  # ---------------------------------------------------------------------------
+  detailedMonitoring: true
+
+  # ---------------------------------------------------------------------------
+  # Tags — applied to every EC2 instance, EBS volume, and ENI Karpenter
+  # creates. Used by the billing pipeline and by `aws ec2 describe-*`
+  # filters in incident response.
+  # ---------------------------------------------------------------------------
+  tags:
+    Environment: prod
+    Workload: phoenix-liveview
+    ManagedBy: karpenter
+    CostCenter: platform
+    # Required by Karpenter's own discovery — this is how Karpenter
+    # recognises instances it owns and is allowed to terminate.
+    karpenter.sh/discovery: liveview-cluster

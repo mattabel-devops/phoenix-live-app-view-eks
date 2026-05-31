@@ -1,0 +1,27 @@
+{{ include "phoenix-liveview.fullname" . }} deployed.
+
+Quick verification:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "phoenix-liveview.fullname" . }}
+
+Port-forward to hit the LiveView page locally:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "phoenix-liveview.fullname" . }} 4000:{{ .Values.service.port }}
+  open http://localhost:4000
+
+Required secret keys (in secret/{{ .Values.secrets.existingSecret }}):
+  SECRET_KEY_BASE   - 64-byte hex; rotate per environment
+  DATABASE_URL      - ecto://user:pass@host/db ; points at RDS in gov-west-1
+  RELEASE_COOKIE    - shared by all replicas; required for libcluster
+
+{{- if not .Values.hpa.enabled }}
+
+NOTE: HPA is disabled. The Deployment is pinned at replicas={{ .Values.replicaCount }}.
+{{- end }}
+{{- if not .Values.pdb.enabled }}
+
+WARNING: PodDisruptionBudget is disabled. Voluntary disruption (node drain,
+Karpenter consolidation, eviction) can take all pods down at once and drop
+every open WebSocket. Enable pdb.enabled=true for any non-dev environment.
+{{- end }}

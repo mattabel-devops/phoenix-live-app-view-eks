@@ -1,0 +1,191 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "phoenix-liveview.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.hpa.enabled }}
+  # When HPA is on, we omit `replicas:` so the HPA controller owns the
+  # field. Setting both creates a fight between Deployment reconcile and
+  # the HPA, with the symptom of "replicas keep flapping between N and M".
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "phoenix-liveview.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "phoenix-liveview.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Force a rollout whenever the projected ConfigMap changes — without
+        # this, a config-only change leaves running pods on stale values
+        # because envFrom doesn't trigger restarts on its own.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.metrics.port }}"
+        prometheus.io/path: "{{ .Values.metrics.path }}"
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "phoenix-liveview.serviceAccountName" . }}
+      # Set explicitly to false — the default is `true`, which mounts the
+      # SA token into the pod even when nothing uses it. That token is the
+      # most commonly-abused credential in a compromised pod.
+      automountServiceAccountToken: {{ .Values.rbac.create | default false }}
+
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # Long enough to drain in-flight LiveView sockets after SIGTERM. See
+      # values.yaml gracefulShutdown block for the full timeline.
+      terminationGracePeriodSeconds: {{ .Values.gracefulShutdown.terminationGracePeriodSeconds }}
+
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpreadConstraints }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "phoenix-liveview.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+
+      containers:
+        - name: liveview
+          image: {{ include "phoenix-liveview.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+
+          env:
+            # ----- Runtime config that's safe to expose on the pod spec ----
+            # APP_NAME is set HERE (not via envFrom) because the dependent
+            # variable expansion below (`$(APP_NAME)`) only resolves
+            # variables defined in the `env:` block, NOT in envFrom-sourced
+            # ConfigMap/Secret values. The ConfigMap still carries APP_NAME
+            # for the app's own benefit; this entry shadows it for the
+            # purpose of the substitution.
+            - name: APP_NAME
+              value: "demo"
+            - name: PORT
+              value: "4000"
+            - name: PHX_SERVER
+              value: "true"
+            # BEAM tuning — exposed as values so a platform engineer can
+            # adjust without rebuilding the image.
+            - name: ELIXIR_ERL_OPTIONS
+              value: "+P {{ .Values.beam.maxPorts }} +A {{ .Values.beam.asyncThreads }} {{ .Values.beam.extraFlags }}"
+            # Erlang node name — uses the pod IP so libcluster's DNS strategy
+            # can resolve sibling pods through the headless service.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RELEASE_DISTRIBUTION
+              value: "name"
+            - name: RELEASE_NODE
+              value: "$(APP_NAME)@$(POD_IP)"
+            # ----- Non-secret runtime config from ConfigMap ----------------
+          envFrom:
+            - configMapRef:
+                name: {{ include "phoenix-liveview.fullname" . }}-config
+            # ----- Secret material (out-of-band) ---------------------------
+            - secretRef:
+                name: {{ .Values.secrets.existingSecret }}
+
+          # preStop bridges the gap between "pod marked Terminating" and
+          # "kube-proxy on every node has stopped routing to this pod".
+          # During this sleep, the pod is still serving but not receiving
+          # new traffic; the BEAM is still happy. Only after the sleep
+          # ends does the container runtime deliver SIGTERM.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep {{ .Values.gracefulShutdown.preStopSleepSeconds }}
+
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            {{- toYaml (omit .Values.probes.startup "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            {{- toYaml (omit .Values.probes.readiness "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            {{- toYaml (omit .Values.probes.liveness "enabled") | nindent 12 }}
+          {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+          volumeMounts:
+            # BEAM writes erl_crash.dump and (occasionally) tmp files. We
+            # keep the root filesystem read-only and grant a small writable
+            # emptyDir for these.
+            - name: tmp
+              mountPath: /tmp
+            # Phoenix release ships a writable var/ for the boot script
+            # (start_erl.data, etc). Mount an emptyDir over it so
+            # readOnlyRootFilesystem doesn't block startup.
+            - name: app-tmp
+              mountPath: /app/tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: app-tmp
+          emptyDir:
+            sizeLimit: 64Mi

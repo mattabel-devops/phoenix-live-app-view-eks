@@ -1,0 +1,71 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "phoenix-liveview.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "phoenix-liveview.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Traffic from the ingress controller — that's how external clients
+    # reach the LiveView page.
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingress.fromNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 4000
+    # Peer-to-peer Erlang distribution within the namespace, for libcluster.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "phoenix-liveview.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4369        # epmd
+        - protocol: TCP
+          port: 9100        # erldist
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDNS }}
+    # DNS — kube-dns. Without this everything else breaks.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- range .Values.networkPolicy.egress.rdsCidrs }}
+    # RDS — locked down to specific CIDRs so a compromised pod can't
+    # reach arbitrary hosts on the VPC.
+    - to:
+        - ipBlock:
+            cidr: {{ . }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
+    # Peer-to-peer Erlang distribution (egress side of the ingress rule).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "phoenix-liveview.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4369
+        - protocol: TCP
+          port: 9100
+{{- end }}

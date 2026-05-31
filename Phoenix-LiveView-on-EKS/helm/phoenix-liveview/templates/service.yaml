@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "phoenix-liveview.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  sessionAffinity: {{ .Values.service.sessionAffinity }}
+  selector:
+    {{- include "phoenix-liveview.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http        # so service-mesh sidecars can route WS correctly
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
+
+{{- if .Values.headlessService.enabled }}
+---
+# Headless service for libcluster DNS-based peer discovery. The
+# clusterIP: None form makes kube-dns return the A records of every
+# pod backing the service, which is exactly what
+# libcluster.Strategy.Kubernetes.DNS expects.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "phoenix-liveview.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+  {{- with .Values.headlessService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  # publishNotReadyAddresses lets libcluster discover peers while they
+  # are still booting. Without it, you get a brief window during a
+  # rollout where new pods can't form a cluster because their A records
+  # haven't been published yet.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "phoenix-liveview.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: epmd
+      port: 4369
+      targetPort: 4369
+      protocol: TCP
+    - name: erldist
+      # Erlang distribution port — only used pod-to-pod inside the
+      # namespace. NetworkPolicy below restricts this to peers only.
+      port: 9100
+      targetPort: 9100
+      protocol: TCP
+{{- end }}

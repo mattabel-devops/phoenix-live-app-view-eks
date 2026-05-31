@@ -1,0 +1,25 @@
+# Helm
+helm/phoenix-liveview/charts/
+helm/phoenix-liveview/Chart.lock
+*.tgz
+
+# Local clusters / scratch
+.kube-cache/
+kubeconfig
+*.kubeconfig
+*.local.yaml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets — should never be committed
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+secrets/
